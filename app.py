@@ -4,6 +4,9 @@ import pandas as pd
 import time
 import random
 import streamlit as st
+import feedparser
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
 class TasteOfHomeCrawler:
     def __init__(self):
@@ -26,27 +29,43 @@ class TasteOfHomeCrawler:
             "https://www.tasteofhome.com/recipes/orange-buttermilk-cupcakes/"
         ]
 
-    def scrape_recipe(self, url):
+    def get_links_from_rss(self, rss_url):
+        try:
+            feed = feedparser.parse(rss_url)
+            return [entry.link for entry in feed.entries]
+        except Exception as e:
+            st.error(f"Error fetching RSS feed: {e}")
+            return []
+
+    def scrape_recipe(self, url, use_js=False):
         try:
             full_url = url if url.startswith('http') else self.base_url + url
-            response = requests.get(full_url, headers=self.headers)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+
+            if use_js:
+                options = Options()
+                options.add_argument('--headless')
+                options.add_argument('--disable-gpu')
+                driver = webdriver.Chrome(options=options)
+                driver.get(full_url)
+                time.sleep(3)
+                html = driver.page_source
+                driver.quit()
+                soup = BeautifulSoup(html, 'html.parser')
+            else:
+                response = requests.get(full_url, headers=self.headers)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
 
             title = soup.find('h1') or soup.find('h1', class_='entry-title')
             title = title.get_text(strip=True) if title else "No title"
 
             ingredients = []
-            ingredients_section = soup.find('ul', class_='recipe-ingredients__list') or \
-                                  soup.find('div', class_='recipe-ingredients') or \
-                                  soup.find('div', class_='ingredients')
+            ingredients_section = soup.find('ul', class_='recipe-ingredients__list') or                                   soup.find('div', class_='recipe-ingredients') or                                   soup.find('div', class_='ingredients')
             if ingredients_section:
                 ingredients = [li.get_text(strip=True) for li in ingredients_section.find_all('li')]
 
             directions = []
-            directions_section = soup.find('ul', class_='recipe-directions__list') or \
-                                 soup.find('div', class_='recipe-directions') or \
-                                 soup.find('div', class_='directions')
+            directions_section = soup.find('ul', class_='recipe-directions__list') or                                  soup.find('div', class_='recipe-directions') or                                  soup.find('div', class_='directions')
             if directions_section:
                 directions = [li.get_text(strip=True) for li in directions_section.find_all('li')]
                 if not directions:
@@ -76,16 +95,14 @@ class TasteOfHomeCrawler:
             st.error(f"Error scraping {url}: {e}")
             return None
 
-    def crawl(self, num_recipes=10):
-        links = self.get_hardcoded_links()[:num_recipes]
+    def crawl(self, links, use_js=False):
         recipes = []
-
         progress_bar = st.progress(0)
         status_text = st.empty()
 
         for i, link in enumerate(links):
             status_text.text(f"Scraping recipe {i + 1}/{len(links)}...")
-            recipe = self.scrape_recipe(link)
+            recipe = self.scrape_recipe(link, use_js=use_js)
             if recipe:
                 recipes.append(recipe)
             progress_bar.progress((i + 1) / len(links))
@@ -97,28 +114,41 @@ class TasteOfHomeCrawler:
 
 def main():
     st.set_page_config(page_title="Taste of Home Crawler", layout="wide")
-    st.title("🥧 Taste of Home Recipe Crawler")
+    st.title("Taste of Home Recipe Crawler")
 
     crawler = TasteOfHomeCrawler()
 
     if "recipes" not in st.session_state:
         st.session_state.recipes = []
 
+    data_source = st.radio("Select data source:", ["Hardcoded", "RSS Feed"])
     num_recipes = st.slider("Number of recipes to fetch (max 10):", 1, 10, 10)
+    use_js = st.checkbox("Use JavaScript rendering (Selenium)?")
+
+    links = []
+    if data_source == "Hardcoded":
+        links = crawler.get_hardcoded_links()[:num_recipes]
+    elif data_source == "RSS Feed":
+        rss_url = st.text_input("Enter RSS Feed URL", "https://www.tasteofhome.com/feed/")
+        if rss_url:
+            links = crawler.get_links_from_rss(rss_url)[:num_recipes]
 
     if st.button("Start Crawling"):
-        with st.spinner("Crawling recipes..."):
-            st.session_state.recipes = crawler.crawl(num_recipes)
-            st.success(f"Fetched {len(st.session_state.recipes)} recipes.")
+        if links:
+            with st.spinner("Crawling recipes..."):
+                st.session_state.recipes = crawler.crawl(links, use_js=use_js)
+                st.success(f"Fetched {len(st.session_state.recipes)} recipes.")
+        else:
+            st.warning("No links to crawl.")
 
     recipes = st.session_state.recipes
 
     if recipes:
         df = pd.DataFrame(recipes)
-        st.subheader("📋 Recipes Overview")
+        st.subheader("Recipes Overview")
         st.dataframe(df[['title', 'prep_time', 'cook_time', 'servings']], use_container_width=True)
 
-        st.subheader("🔍 Recipe Details")
+        st.subheader("Recipe Details")
         selected_title = st.selectbox("Select a recipe:", [r['title'] for r in recipes])
         selected_recipe = next((r for r in recipes if r['title'] == selected_title), None)
 
@@ -128,14 +158,13 @@ def main():
             st.markdown(f"**Prep Time**: {selected_recipe['prep_time']}")
             st.markdown(f"**Cook Time**: {selected_recipe['cook_time']}")
             st.markdown(f"**Servings**: {selected_recipe['servings']}")
-
             if selected_recipe['image_url']:
                 st.image(selected_recipe['image_url'], use_container_width=True)
 
-            st.markdown("#### 🥄 Ingredients")
+            st.markdown("#### Ingredients")
             st.text(selected_recipe['ingredients'])
 
-            st.markdown("#### 🍳 Directions")
+            st.markdown("#### Directions")
             st.text(selected_recipe['directions'])
 
     if st.button("Save to CSV"):
@@ -144,9 +173,8 @@ def main():
             csv_file = "tasteofhome_recipes.csv"
             df.to_csv(csv_file, index=False)
             st.success(f"Recipes saved to `{csv_file}`")
-
             with open(csv_file, "rb") as f:
-                st.download_button("📥 Download CSV", data=f, file_name=csv_file, mime="text/csv")
+                st.download_button("Download CSV", data=f, file_name=csv_file, mime="text/csv")
         else:
             st.warning("No recipes to save.")
 
