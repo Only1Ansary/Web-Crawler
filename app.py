@@ -155,7 +155,7 @@ def main():
             if selected_recipe:
                 st.markdown(f"### {selected_recipe['title']}")
                 if selected_recipe['image_url']:
-                    st.image(selected_recipe['image_url'], use_column_width=True)
+                    st.image(selected_recipe['image_url'], use_container_width=True)
                 st.markdown(f"**URL**: [{selected_recipe['url']}]({selected_recipe['url']})")
                 st.markdown(f"**Prep Time:** {selected_recipe['prep_time']}")
                 st.markdown(f"**Cook Time:** {selected_recipe['cook_time']}")
