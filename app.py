@@ -1,17 +1,22 @@
 import streamlit as st
 import requests
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-from collections import Counter
 import re
 
-# Optional: Playwright/Selenium imports (only if used)
-# from playwright.sync_api import sync_playwright
-
 st.set_page_config(page_title="Web Audit Tool", layout="wide")
-
 st.title("🕷️ Web Audit Tool")
 st.markdown("A 5-step audit tool for analyzing a website's crawlability, content, JS/API dependencies, and more.")
+
+# Initialize session state
+if "robots_data" not in st.session_state:
+    st.session_state.robots_data = None
+
+if "content_data" not in st.session_state:
+    st.session_state.content_data = None
+
+if "jsapi" not in st.session_state:
+    st.session_state.jsapi = None
 
 # Step 1 – Crawlability Specialist
 st.header("🔍 Step 1: Crawlability Analysis")
@@ -55,16 +60,18 @@ if st.button("Analyze"):
         st.error("Please enter a valid URL.")
     else:
         with st.spinner("Fetching and analyzing robots.txt..."):
-            robots_data = analyze_robots_txt(url)
-        if robots_data["status"] == "Success":
-            st.success("Crawlability analysis completed.")
-            st.subheader("Crawlability Rules")
-            st.write("**Allowed Paths:**", robots_data["allowed"] or "None")
-            st.write("**Disallowed Paths:**", robots_data["disallowed"] or "None")
-            st.write("**Crawl Delay:**", robots_data["crawl_delay"] or "Not specified")
-            st.write("**Sitemaps:**", robots_data["sitemaps"] or "Not found")
-        else:
-            st.error(robots_data["status"])
+            st.session_state.robots_data = analyze_robots_txt(url)
+
+robots_data = st.session_state.robots_data
+if robots_data and robots_data.get("status") == "Success":
+    st.success("Crawlability analysis completed.")
+    st.subheader("Crawlability Rules")
+    st.write("**Allowed Paths:**", robots_data["allowed"] or "None")
+    st.write("**Disallowed Paths:**", robots_data["disallowed"] or "None")
+    st.write("**Crawl Delay:**", robots_data["crawl_delay"] or "Not specified")
+    st.write("**Sitemaps:**", robots_data["sitemaps"] or "Not found")
+elif robots_data:
+    st.error(robots_data["status"])
 
 # Step 2 – Content Extractor
 st.header("📄 Step 2: Content Extraction")
@@ -81,14 +88,17 @@ def extract_content(url):
         return {
             "titles": titles,
             "description": description,
-            "links": links[:10]  # Limit output for clarity
+            "links": links[:10]
         }
     except Exception as e:
         return {"error": str(e)}
 
 if st.button("Extract Content"):
     with st.spinner("Extracting page content..."):
-        content = extract_content(url)
+        st.session_state.content_data = extract_content(url)
+
+content = st.session_state.content_data
+if content:
     if "error" in content:
         st.error(f"Extraction failed: {content['error']}")
     else:
@@ -112,13 +122,16 @@ def detect_js_and_apis(url):
 
         api_keywords = re.findall(r"https?://[^\s\"']+/api/[^\s\"']+", r.text)
         result["api_keywords"] = list(set(api_keywords))
-    except:
-        result["error"] = "Failed to check JS/API usage."
+    except Exception as e:
+        result["error"] = f"Failed to check JS/API usage: {e}"
     return result
 
 if st.button("Check JS/API"):
     with st.spinner("Analyzing JS and APIs..."):
-        jsapi = detect_js_and_apis(url)
+        st.session_state.jsapi = detect_js_and_apis(url)
+
+jsapi = st.session_state.jsapi
+if jsapi:
     if "error" in jsapi:
         st.error(jsapi["error"])
     else:
@@ -132,20 +145,20 @@ st.header("📊 Step 4: Dashboard & Recommendations")
 
 if url:
     st.subheader("📈 Summary")
-    st.metric("Allowed Paths", len(robots_data.get("allowed", [])))
-    st.metric("Disallowed Paths", len(robots_data.get("disallowed", [])))
-    st.metric("JS Scripts", "Yes" if jsapi.get("js_detected") else "No")
-    st.metric("API Endpoints", len(jsapi.get("api_keywords", [])))
+    st.metric("Allowed Paths", len((robots_data or {}).get("allowed", [])))
+    st.metric("Disallowed Paths", len((robots_data or {}).get("disallowed", [])))
+    st.metric("JS Scripts", "Yes" if (jsapi or {}).get("js_detected") else "No")
+    st.metric("API Endpoints", len((jsapi or {}).get("api_keywords", [])))
 
     st.subheader("🛠️ Recommendations")
     recs = []
-    if robots_data.get("crawl_delay"):
+    if (robots_data or {}).get("crawl_delay"):
         recs.append("Respect the crawl-delay directive.")
-    if jsapi.get("js_detected"):
-        recs.append("Consider using Playwright or Selenium for dynamic rendering.")
-    if jsapi.get("rss"):
+    if (jsapi or {}).get("js_detected"):
+        recs.append("Use Playwright or Selenium for dynamic rendering.")
+    if (jsapi or {}).get("rss"):
         recs.append("Use RSS feed for structured data extraction.")
-    if jsapi.get("api_keywords"):
+    if (jsapi or {}).get("api_keywords"):
         recs.append("Check if API requires auth, then crawl via API.")
     st.write(recs if recs else "No major recommendations.")
 
@@ -167,5 +180,5 @@ st.markdown("""
 **Future Features:**
 - Visual sitemap generation
 - Pagination handling
-- Full Playwright/Selenium headless support
+- Full Playwright/Selenium support
 """)
