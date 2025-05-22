@@ -1,477 +1,562 @@
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import time
+import os
 import random
-import streamlit as st
-import feedparser # For RSS feeds
-from urllib.parse import urljoin # For joining relative URLs
+import cv2
+import joblib
+import numpy as np
+import pickle
+import gradio as gr
+from PIL import Image
+from collections import Counter
+from sklearn.discriminant_analysis import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import LinearSVC
+import torch
+import torch.optim as optim
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
+from torchvision.models import ResNet18_Weights
+from torchvision import datasets, transforms, models
+from tensorflow.keras.preprocessing.image import ImageDataGenerator # type: ignore
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau # type: ignore
+from tensorflow.keras import Sequential, regularizers# type: ignore
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization# type: ignore
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.models import load_model# type: ignore
+from tensorflow.keras.applications.vgg16 import VGG16, preprocess_input# type: ignore
+from skimage.feature import hog, local_binary_pattern
+import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
+import time
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# Selenium imports for JS handling (optional, only if JS rendering is used)
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    SELENIUM_AVAILABLE = True
-except ImportError:
-    SELENIUM_AVAILABLE = False
+# ---------------- Configuration ----------------
+class_names = ['Buffalo', 'cat', 'deer', 'dog', 'Elephant', 'horse', 'lion', 'Rhino', 'Zebra']
+DATA_DIR = "Data"
+CNN_MODEL_PATH = "cnn_model.h5"
+KNN_MODEL_PATH = "knn_model.pkl"
+SVM_MODEL_PATH = "svm_model.joblib"
+RESNET_MODEL_PATH = "resnet_model.pth"
+RF_MODEL_PATH = "animal_classifier_rf.joblib"
+AUGMENTED_DIR = "Augmented_Data"
+IMG_SIZE = 128
 
-class TasteOfHomeCrawler:
-    def __init__(self):
-        self.base_url = "https://www.tasteofhome.com"
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+# -------------------- Utilities --------------------
+def enhance_image(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hsv[:, :, 2] = cv2.equalizeHist(hsv[:, :, 2])
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    def get_hardcoded_links(self):
-        return [
-            "https://www.tasteofhome.com/recipes/favorite-chicken-potpie/",
-            "https://www.tasteofhome.com/recipes/puff-pastry-chicken-potpie/",
-            "https://www.tasteofhome.com/recipes/chicken-potpie-soup/",
-            "https://www.tasteofhome.com/recipes/homemade-chicken-potpie/",
-            "https://www.tasteofhome.com/recipes/ham-potpie/",
-            "https://www.tasteofhome.com/recipes/buttermilk-biscuit-ham-potpie/",
-            "https://www.tasteofhome.com/recipes/buttermilk-biscuits/",
-            "https://www.tasteofhome.com/recipes/buttermilk-pancakes/",
-            "https://www.tasteofhome.com/recipes/buttermilk-chocolate-cupcakes/",
-            "https://www.tasteofhome.com/recipes/orange-buttermilk-cupcakes/"
-        ]
-
-    def _parse_soup_for_recipe(self, soup, full_url):
-        """Helper function to extract recipe details from a BeautifulSoup soup object."""
-        try:
-            title = soup.find('h1') or soup.find('h1', class_='entry-title')
-            title = title.get_text(strip=True) if title else "No title found"
-
-            ingredients = []
-            ingredients_section = soup.find('ul', class_='recipe-ingredients__list') or \
-                                  soup.find('div', class_='recipe-ingredients') or \
-                                  soup.find('div', class_='ingredients')
-            if ingredients_section:
-                ingredients = [li.get_text(strip=True) for li in ingredients_section.find_all('li') if li.get_text(strip=True)]
-
-            directions = []
-            directions_section = soup.find('ul', class_='recipe-directions__list') or \
-                                 soup.find('div', class_='recipe-directions') or \
-                                 soup.find('div', class_='directions')
-            if directions_section:
-                directions_items = directions_section.find_all(['li', 'p']) # Common tags for directions
-                directions = [item.get_text(strip=True) for item in directions_items if item.get_text(strip=True)]
-
-
-            prep_time_el = soup.find('div', class_='prep-time') or soup.find('span', class_='prep-time') or \
-                           soup.find(attrs={"data-label": "Prep Time:"}) or soup.find(string=lambda text: "Prep:" in text if text else False)
-            prep_time = prep_time_el.get_text(strip=True).replace("Prep: ", "") if prep_time_el else "N/A"
-            if prep_time == "N/A" and prep_time_el: # Try to get next element if it's just a label
-                next_sibling = prep_time_el.find_next_sibling()
-                if next_sibling: prep_time = next_sibling.get_text(strip=True)
-
-
-            cook_time_el = soup.find('div', class_='cook-time') or soup.find('span', class_='cook-time') or \
-                           soup.find(attrs={"data-label": "Cook Time:"}) or soup.find(string=lambda text: "Cook:" in text if text else False)
-            cook_time = cook_time_el.get_text(strip=True).replace("Cook: ", "") if cook_time_el else "N/A"
-            if cook_time == "N/A" and cook_time_el:
-                next_sibling = cook_time_el.find_next_sibling()
-                if next_sibling: cook_time = next_sibling.get_text(strip=True)
-
-
-            servings_el = soup.find('div', class_='servings') or soup.find('span', class_='servings') or \
-                          soup.find(attrs={"data-label": "Servings:"}) or soup.find(string=lambda text: "Yield:" in text if text else False)
-            servings = servings_el.get_text(strip=True).replace("Yield: ", "") if servings_el else "N/A"
-            if servings == "N/A" and servings_el:
-                next_sibling = servings_el.find_next_sibling()
-                if next_sibling: servings = next_sibling.get_text(strip=True)
-
-            image_url = ""
-            image_tag = soup.find('img', class_='primary-image') or \
-                        soup.find('div', class_='recipe-image-wrap rd_images_load') # Common class observed
-            if image_tag:
-                img_src_tag = image_tag.find('img') if image_tag.name == 'div' else image_tag
-                if img_src_tag:
-                    image_url = img_src_tag.get("src", "") or img_src_tag.get("data-src", "") # Check data-src for lazy loading
-                    if image_url and not image_url.startswith('http'):
-                        image_url = urljoin(full_url, image_url)
-
-            return {
-                'title': title,
-                'url': full_url,
-                'ingredients': "\n".join(ingredients),
-                'directions': "\n".join(directions),
-                'prep_time': prep_time,
-                'cook_time': cook_time,
-                'servings': servings,
-                'image_url': image_url
-            }
-        except Exception as e:
-            st.warning(f"Error parsing content for {full_url}: {e}")
-            return { # Return with N/A to avoid breaking the process for one bad parse
-                'title': "Parsing Error", 'url': full_url, 'ingredients': "N/A", 'directions': "N/A",
-                'prep_time': "N/A", 'cook_time': "N/A", 'servings': "N/A", 'image_url': ""
-            }
-
-    def scrape_recipe_js(self, url, driver_path):
-        if not SELENIUM_AVAILABLE:
-            st.error("Selenium library is not available. Please install it.")
-            return None
-        if not driver_path:
-            st.error("ChromeDriver path is not provided for JavaScript rendering.")
-            return None
-
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--no-sandbox') # Important for some environments
-        options.add_argument('--disable-dev-shm-usage') # Important for some environments
-        options.add_argument(f'user-agent={self.headers["User-Agent"]}')
-        
-        service = Service(executable_path=driver_path)
-        driver = None
-        try:
-            driver = webdriver.Chrome(service=service, options=options)
-            full_url = url if url.startswith('http') else self.base_url + url
-            driver.get(full_url)
-            
-            # Wait for a general element that indicates page load, e.g., recipe title or ingredients list
-            # Adjust timeout and selector as needed for the specific site
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "h1, .recipe-ingredients__list, .recipe-directions__list"))
-            )
-            # Allow a bit more time for any lazy-loaded content or JS hydration
-            time.sleep(random.uniform(2, 4)) # Adjust as needed
-
-            page_source = driver.page_source
-            soup = BeautifulSoup(page_source, 'html.parser')
-            return self._parse_soup_for_recipe(soup, full_url)
-
-        except Exception as e:
-            st.error(f"Error scraping {url} with JS: {e}")
-            return None
-        finally:
-            if driver:
-                driver.quit()
-
-    def scrape_recipe(self, url, use_js=False, driver_path=None):
-        full_url = url if url.startswith('http') else self.base_url + url
-
-        if use_js:
-            return self.scrape_recipe_js(full_url, driver_path)
-        
-        try:
-            response = requests.get(full_url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            return self._parse_soup_for_recipe(soup, full_url)
-
-        except requests.exceptions.RequestException as e:
-            st.error(f"Request error scraping {full_url}: {e}")
-            return None
-        except Exception as e: # Catch other parsing errors if any slip through _parse_soup_for_recipe
-            st.error(f"General error scraping {full_url}: {e}")
-            return None
-
-
-    def fetch_links_from_rss(self, rss_url):
-        st.info(f"Fetching links from RSS: {rss_url}")
-        try:
-            feed = feedparser.parse(rss_url)
-            if feed.bozo:
-                st.error(f"Error parsing RSS feed (possibly malformed): {feed.bozo_exception}")
-                return []
-            
-            links = [entry.link for entry in feed.entries if hasattr(entry, 'link')]
-            if not links:
-                st.warning(f"No recipe links found in RSS feed: {rss_url}")
-            else:
-                st.success(f"Found {len(links)} links in RSS feed.")
-            return links
-        except Exception as e:
-            st.error(f"Could not fetch or parse RSS feed {rss_url}: {e}")
-            return []
-
-    def fetch_recipes_from_api(self, api_endpoint): # Conceptual
-        st.info(f"Attempting to fetch from API: {api_endpoint} (This is a conceptual placeholder)")
-        # This is a placeholder. Real API interaction would require:
-        # 1. Knowing the API's request format (params, headers, auth)
-        # 2. Knowing the API's response structure (JSON, XML)
-        # 3. Parsing the response to fit the common recipe dictionary format.
-        try:
-            # response = requests.get(api_endpoint, headers=self.headers, ...)
-            # response.raise_for_status()
-            # api_data = response.json() # Assuming JSON
-            # recipes_from_api = []
-            # for item in api_data.get('recipes', []): # Example structure
-            #     recipe_data = {
-            #         'title': item.get('title'),
-            #         'url': item.get('source_url'), # URL to the actual recipe page if API gives summaries
-            #         'ingredients': "\n".join(item.get('ingredientLines', [])),
-            #         'directions': item.get('instructions'),
-            #         'prep_time': item.get('prepTime'),
-            #         'cook_time': item.get('cookTime'),
-            #         'servings': item.get('yield'),
-            #         'image_url': item.get('image')
-            #     }
-            #     recipes_from_api.append(recipe_data)
-            # st.success(f"Fetched {len(recipes_from_api)} items from API.")
-            # return recipes_from_api
-            st.warning("API fetching is not implemented for this website as no public recipe API is known.")
-            return [] # Return empty list as it's a placeholder
-        except Exception as e:
-            st.error(f"Error fetching from API {api_endpoint}: {e}")
-            return []
-
-    def crawl(self, num_items=10, source_type="hardcoded", source_input=None, use_js=False, driver_path=None):
-        links_to_scrape = []
-        direct_recipes = [] # For APIs that might return full data
-
-        if source_type == "hardcoded":
-            links_to_scrape = self.get_hardcoded_links()[:num_items]
-        elif source_type == "rss":
-            if source_input:
-                links_to_scrape = self.fetch_links_from_rss(source_input)[:num_items]
-            else:
-                st.warning("RSS URL not provided.")
-                return []
-        elif source_type == "api":
-            if source_input:
-                # This is conceptual. If API returns full data, direct_recipes would be populated.
-                # If API returns links, links_to_scrape would be populated.
-                direct_recipes = self.fetch_recipes_from_api(source_input) # Placeholder
-                # For this example, we'll assume API gives full data and doesn't need further scraping
-                if direct_recipes:
-                     st.success(f"Conceptual API returned {len(direct_recipes)} direct recipes.")
-                     return direct_recipes[:num_items] # Return directly if API provides full data
-                else:
-                    st.info("Conceptual API did not return direct recipes or is not implemented.")
-                    return []
-            else:
-                st.warning("API endpoint not provided.")
-                return []
-        
-        scraped_recipes = []
-        if not links_to_scrape:
-            if source_type not in ["api"]: # API might not produce links if it's meant to give data directly
-                 st.info("No links to process for scraping.")
-            return scraped_recipes # or direct_recipes if API was the source and returned data
-
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        for i, link in enumerate(links_to_scrape):
-            status_text.text(f"Scraping recipe {i + 1}/{len(links_to_scrape)}: {link}")
-            recipe = self.scrape_recipe(link, use_js=use_js, driver_path=driver_path)
-            if recipe:
-                # Basic validation: ensure at least a title was found
-                if recipe.get('title') and recipe.get('title') != "Parsing Error" and recipe.get('title') != "No title found":
-                    scraped_recipes.append(recipe)
-                elif recipe.get('title') == "Parsing Error":
-                     st.warning(f"Skipping recipe due to parsing error: {link}")
-                else:
-                    st.warning(f"Skipping recipe with missing title: {link}")
-
-            progress_bar.progress((i + 1) / len(links_to_scrape))
-            # Ensure politeness even if JS scraping introduces its own waits
-            time.sleep(random.uniform(0.5, 1.5)) 
-
-        if not scraped_recipes:
-            status_text.text("No recipes were successfully scraped.")
-        else:
-            status_text.text(f"Scraping complete. Fetched {len(scraped_recipes)} recipes.")
-        return scraped_recipes
-
-def main():
-    st.set_page_config(page_title="Recipe Crawler", layout="wide")
-    st.title("\U0001F967 Universal Recipe Crawler")
-    st.markdown("Fetches recipes from 'Taste of Home' or other sources via links, RSS, or (conceptually) an API.")
-
-    crawler = TasteOfHomeCrawler()
-
-    if "recipes" not in st.session_state:
-        st.session_state.recipes = []
-
-    # Sidebar for controls
-    st.sidebar.header("\U0001F527 Crawler Configuration")
-    source_type_display = st.sidebar.selectbox(
-        "Choose data source:",
-        ("Hardcoded TasteOfHome Links", "RSS Feed", "API (Conceptual)")
+# -------------------- CNN --------------------
+def train_and_save_cnn():
+    X, y = [], []
+    print("Training CNN model...")
+    for idx, cn in enumerate(class_names):
+        folder = os.path.join(DATA_DIR, cn)
+        for fn in os.listdir(folder):
+            path = os.path.join(folder, fn)
+            img = cv2.imread(path)
+            if img is None: continue
+            img = enhance_image(img)
+            img = cv2.resize(img, (128, 128)) / 255.0
+            X.append(img); y.append(idx)
+    X, y = np.array(X), np.array(y)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2,
+                                                        random_state=38, stratify=y)
+    datagen = ImageDataGenerator(
+        rotation_range=10,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True
     )
+    datagen.fit(X_train)
+    model = Sequential([
+        Conv2D(32,(3,3),activation='relu',padding='same',
+               kernel_regularizer=regularizers.l2(0.001), input_shape=(128,128,3)),
+        BatchNormalization(),
+        Conv2D(32,(3,3),activation='relu',padding='same'), BatchNormalization(),
+        MaxPooling2D((2,2)), Dropout(0.25),
+        Conv2D(64,(3,3),activation='relu',padding='same',
+               kernel_regularizer=regularizers.l2(0.001)),
+        BatchNormalization(), Conv2D(64,(3,3),activation='relu',padding='same'),
+        BatchNormalization(), MaxPooling2D((2,2)), Dropout(0.35),
+        Conv2D(128,(3,3),activation='relu',padding='same',
+               kernel_regularizer=regularizers.l2(0.001)),
+        BatchNormalization(), Conv2D(128,(3,3),activation='relu',padding='same'),
+        BatchNormalization(), MaxPooling2D((2,2)), Dropout(0.5),
+        Flatten(), Dense(256,activation='relu'), BatchNormalization(), Dropout(0.5),
+        Dense(len(class_names),activation='softmax')
+    ])
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
+    model.fit(
+        datagen.flow(X_train,y_train,batch_size=32),
+        validation_data=(X_test,y_test), epochs=50,
+        callbacks=[early_stop, reduce_lr]
+    )
+    loss, acc = model.evaluate(X_test,y_test)
+    print(f"CNN test accuracy: {acc:.4f}")
+    model.save(CNN_MODEL_PATH)
+    return model
 
-    source_input_val = None
-    source_type_arg = "hardcoded"
+def load_cnn_model():
+    return load_model(CNN_MODEL_PATH) if os.path.exists(CNN_MODEL_PATH) else train_and_save_cnn()
 
-    if source_type_display == "RSS Feed":
-        source_type_arg = "rss"
-        source_input_val = st.sidebar.text_input(
-            "Enter RSS Feed URL:", 
-            "https://www.tasteofhome.com/collection/top-10-chicken-recipes/feed/" # Example
-        )
-    elif source_type_display == "API (Conceptual)":
-        source_type_arg = "api"
-        source_input_val = st.sidebar.text_input("Enter API Endpoint URL (conceptual):")
+# -------------------- KNN --------------------
+class KNNClassifier:
+    def __init__(self, k=5): self.k=k; self.le=LabelEncoder()
+    def fit(self,X,y):
+        self.X_train=np.array(X); self.y_train=self.le.fit_transform(y)
+        self.mean,self.std = self.X_train.mean(0), self.X_train.std(0)
+        self.X_train=(self.X_train-self.mean)/(self.std+1e-8)
+    def predict(self,X_test):
+        X=(X_test-self.mean)/(self.std+1e-8)
+        preds=[]
+        for x in tqdm(X,desc="KNN predicting"):
+            d = 1 - np.dot(self.X_train,x)/(np.linalg.norm(self.X_train,axis=1)*np.linalg.norm(x)+1e-8)
+            idxs = np.argpartition(d,self.k)[:self.k]
+            lbls = self.y_train[idxs]
+            preds.append(Counter(lbls).most_common(1)[0][0])
+        return self.le.inverse_transform(preds)
 
-    num_items_label = "Number of recipes from hardcoded list:" if source_type_arg == "hardcoded" else "Max recipes/links to process from source:"
-    num_items = st.sidebar.slider(num_items_label, 1, 25, 10)
+cnn_feature_extractor = VGG16(weights='imagenet', include_top=False, pooling='avg')
+def extract_features(img):
+    img = cv2.resize(img, (224, 224))
 
-    use_js_scraping = False
-    chromedriver_path_input = None
+    if len(img.shape) == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.shape[2] == 1:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
-    if SELENIUM_AVAILABLE:
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("JavaScript Rendering (Advanced)")
-        use_js_scraping = st.sidebar.checkbox("Enable JS Rendering (Slower, requires ChromeDriver)")
-        if use_js_scraping:
-            chromedriver_path_input = st.sidebar.text_input(
-                "Path to ChromeDriver executable:",
-                help="e.g., C:\\path\\to\\chromedriver.exe or /usr/local/bin/chromedriver. Ensure it matches your Chrome version."
-            )
-            if not chromedriver_path_input:
-                st.sidebar.warning("ChromeDriver path is required for JS rendering.")
-            else:
-                st.sidebar.caption(f"Using ChromeDriver from: {chromedriver_path_input}")
-    else:
-        st.sidebar.markdown("---")
-        st.sidebar.info("Selenium library not detected. JS rendering is disabled. Install Selenium to enable this feature.")
+    inp = np.expand_dims(img, axis=0).astype(np.float32) / 255.0
+    feat = cnn_feature_extractor.predict(inp, verbose=0)
+    return feat.flatten()
 
+def load_knn_model(k=5):
+    if os.path.exists(KNN_MODEL_PATH):
+        model,X,y = pickle.load(open(KNN_MODEL_PATH,'rb'))
+        model.fit(X,y)
+        return model
+    X,y=[],[]
+    print("Training KNN model...")
+    for cn in class_names:
+        for fn in os.listdir(os.path.join(DATA_DIR,cn)):
+            img=cv2.imread(os.path.join(DATA_DIR,cn,fn))
+            if img is None: continue
+            img=enhance_image(img)
+            X.append(extract_features(img)); y.append(cn)
+    knn=KNNClassifier(k=k)
+    knn.fit(X,y)
+    pickle.dump((knn,X,y), open(KNN_MODEL_PATH,'wb'))
+    return knn
 
-    if st.sidebar.button("\U0001F50D Start Crawling", key="start_crawl_button"):
-        st.session_state.recipes = [] # Clear previous results
-        
-        if use_js_scraping and not chromedriver_path_input:
-            st.error("JavaScript rendering is enabled, but ChromeDriver path is missing.")
-        else:
-            with st.spinner("Crawling in progress... Please wait."):
-                st.session_state.recipes = crawler.crawl(
-                    num_items=num_items,
-                    source_type=source_type_arg,
-                    source_input=source_input_val,
-                    use_js=use_js_scraping,
-                    driver_path=chromedriver_path_input
-                )
-                if st.session_state.recipes:
-                    st.success(f"Successfully fetched {len(st.session_state.recipes)} recipes.")
-                else:
-                    st.info("No recipes were fetched. Check settings, logs, or source URL.")
+# -------------------- SVM --------------------
+def load_svm_model():
+    if os.path.exists(SVM_MODEL_PATH):
+        return joblib.load(SVM_MODEL_PATH)
+    print("Training SVM model...")
+    X,y=[],[]
+    for cn in class_names:
+        for fn in os.listdir(os.path.join(DATA_DIR,cn)):
+            img=cv2.imread(os.path.join(DATA_DIR,cn,fn))
+            if img is None: continue
+            img=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+            img=cv2.resize(img,(128,128))/255.0
+            X.append(img.flatten()); y.append(cn)
+    X_train,X_test,y_train,y_test = train_test_split(X,y,test_size=0.2,random_state=42)
+    scaler=StandardScaler().fit(X_train)
+    svm=LinearSVC(C=1.0, max_iter=10000, dual=False, random_state=42)
+    svm.fit(scaler.transform(X_train),y_train)
+    joblib.dump((svm,scaler),SVM_MODEL_PATH)
+    return svm, scaler
+
+# -------------------- ResNet --------------------
+def load_resnet_model():
+    if os.path.exists(RESNET_MODEL_PATH):
+        model = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        model.fc = nn.Linear(model.fc.in_features,len(class_names))
+        model.load_state_dict(torch.load(RESNET_MODEL_PATH))
+        return model
+    print("Training ResNet model...")
+    tr = transforms.Compose([
+        transforms.Resize((224,224)), transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    dataset = datasets.ImageFolder(DATA_DIR,transform=tr)
+    train_len = int(0.8*len(dataset))
+    train_ds,val_ds = random_split(dataset,[train_len,len(dataset)-train_len])
+    tl = DataLoader(train_ds,batch_size=32,shuffle=True)
+    vl = DataLoader(val_ds,batch_size=32)
+    model = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    model.fc = nn.Linear(model.fc.in_features,len(class_names))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    opt=torch.optim.Adam(model.parameters(),lr=1e-3)
+    crit=nn.CrossEntropyLoss()
+    for epoch in range(10):
+        model.train()
+        for xb,yb in tl:
+            xb,yb = xb.to(device), yb.to(device)
+            opt.zero_grad()
+            loss = crit(model(xb), yb)
+            loss.backward(); opt.step()
+        model.eval()
+    torch.save(model.state_dict(),RESNET_MODEL_PATH)
+    return model
+
+# -------------------- Random Forest (New Implementation) --------------------
+def apply_augmentation(img):
+    augs = [img, cv2.flip(img, 1)]
+    for angle in (-15, 15):
+        M = cv2.getRotationMatrix2D((64, 64), angle, 1.0)
+        augs.append(cv2.warpAffine(img, M, (128, 128)))
+    for beta in (-30, 30): 
+        augs.append(cv2.convertScaleAbs(img, alpha=1.0, beta=beta))
+    augs.append(cv2.GaussianBlur(img, (5, 5), 0))
+    noise = np.random.normal(0, 10, img.shape).astype(np.uint8)
+    augs.append(cv2.add(img, noise))
+    crop = random.randint(0, 25)
+    c = img[crop:crop+102, crop:crop+102]
+    augs.append(cv2.resize(c, (128, 128)))
+    return augs[:5]
+
+def create_augmented_dataset():
+    if os.path.exists(AUGMENTED_DIR):
+        complete = all(os.path.isdir(os.path.join(AUGMENTED_DIR, cn)) and os.listdir(os.path.join(AUGMENTED_DIR, cn))
+                       for cn in class_names)
+        if complete: return
+        import shutil; shutil.rmtree(AUGMENTED_DIR)
+    os.makedirs(AUGMENTED_DIR, exist_ok=True)
+    for cn in class_names:
+        os.makedirs(os.path.join(AUGMENTED_DIR, cn), exist_ok=True)
+        for fn in os.listdir(os.path.join(DATA_DIR, cn)):
+            path = os.path.join(DATA_DIR, cn, fn)
+            img = cv2.imread(path)
+            if img is None: continue
+            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            cv2.imwrite(os.path.join(AUGMENTED_DIR, cn, fn), gray)
+            for i, aug in enumerate(apply_augmentation(gray)):
+                out = f"{os.path.splitext(fn)[0]}_aug{i}.jpg"
+                cv2.imwrite(os.path.join(AUGMENTED_DIR, cn, out), aug)
+
+def extract_rf_features(img):
+    # تحسين التباين
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    equalized = clahe.apply(img)
     
-    # Display recipes
-    recipes_to_display = st.session_state.recipes
+    # تخفيف الضجيج
+    denoised = cv2.fastNlMeansDenoising(equalized, None, h=10)
+    
+    # استخراج ميزات HOG محسنة
+    features, _ = hog(
+        denoised,
+        orientations=12,
+        pixels_per_cell=(12, 12),
+        cells_per_block=(3, 3),
+        block_norm='L2-Hys',
+        visualize=True,
+        transform_sqrt=True
+    )
+    
+    # إضافة Histogram of Gradients
+    hist = cv2.calcHist([denoised], [0], None, [32], [0, 256])
+    hist = hist.flatten()
+    
+    # إضافة ميزات LBP (Local Binary Patterns)
+    lbp = local_binary_pattern(denoised, 8, 1, method='uniform')
+    lbp_hist, _ = np.histogram(lbp, bins=32, range=(0, 32))
+    
+    # دمج جميع الميزات
+    return np.concatenate((features, hist, lbp_hist))
 
-    if recipes_to_display:
-        st.subheader(f"\U0001F4CB Fetched Recipes ({len(recipes_to_display)})")
+def load_rf_data():
+    data = []
+    labels = []
+    originals = []
+    
+    print("🔍 Loading augmented data...")
+    
+    for idx, category in enumerate(class_names):
+        category_path = os.path.join(AUGMENTED_DIR, category)
+        if not os.path.exists(category_path):
+            raise FileNotFoundError(f"Directory {category_path} not found. Please run data augmentation first.")
+            
+        for img_name in tqdm(os.listdir(category_path), desc=f"Loading {category}"):
+            img_path = os.path.join(category_path, img_name)
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+                
+            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+            features = extract_rf_features(img)
+            
+            data.append(features)
+            labels.append(idx)
+            originals.append(img)
+    
+    return np.array(data), np.array(labels), originals
+
+def train_and_save_rf_model():
+    create_augmented_dataset()
+    X, y, _ = load_rf_data()
+    
+    model = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=20,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        max_features='sqrt',
+        bootstrap=True,
+        oob_score=True,
+        random_state=42,
+        n_jobs=-1,
+        verbose=1,
+        class_weight='balanced'
+    )
+    
+    print("🔍 Training Random Forest model...")
+    start_time = time.time()
+    model.fit(X, y)
+    print(f"✅ Training completed in {time.time()-start_time:.2f} seconds")
+    
+    joblib.dump(model, RF_MODEL_PATH, compress=3)
+    return model
+
+def load_rf_model():
+    if os.path.exists(RF_MODEL_PATH):
+        return joblib.load(RF_MODEL_PATH)
+    return train_and_save_rf_model()
+
+def evaluate_rf():
+    model = load_rf_model()
+    X, y, _ = load_rf_data()
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    
+    print("\n📊 Evaluating Random Forest model...")
+    start_time = time.time()
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    
+    print("\n✅ Results:")
+    print(f"Accuracy: {acc*100:.2f}%")
+    print(f"Prediction time: {time.time()-start_time:.2f} seconds")
+    print("\n📝 Classification Report:\n", classification_report(y_test, y_pred, target_names=class_names))
+    
+    # Plot confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(10,8))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title("Confusion Matrix")
+    plt.colorbar()
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45)
+    plt.yticks(tick_marks, class_names)
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.show()
+    
+    return acc
+
+def predict_rf(model, image):
+    img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    features = extract_rf_features(gray)
+    pred = model.predict([features])[0]
+    return class_names[pred]
+
+
+def evaluate_cnn():
+    model = load_model(CNN_MODEL_PATH)
+    X_test, y_test = prepare_test_data()
+    X_test = np.array([enhance_image(img) for img in X_test]) / 255.0
+    
+    y_pred = model.predict(X_test).argmax(axis=1)
+    print("\nCNN Evaluation:")
+    print(classification_report(y_test, y_pred, target_names=class_names))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+# -------------------- KNN Evaluation --------------------
+cnn_feature_extractor = VGG16(weights='imagenet', include_top=False, pooling='avg')
+
+def prepare_test_data(target_size=(128, 128)):
+    X, y = [], []
+    for idx, cn in enumerate(class_names):
+        folder = os.path.join(DATA_DIR, cn)
+        for fn in os.listdir(folder):
+            path = os.path.join(folder, fn)
+            img = cv2.imread(path)
+            if img is None: continue
+            img = cv2.resize(img, target_size)
+            X.append(img)
+            y.append(idx)
+    return np.array(X), np.array(y)
+
+
+def evaluate_knn():
+    model, X, y = pickle.load(open(KNN_MODEL_PATH, 'rb'))
+    X_test, y_test = prepare_test_data()
+    
+    # Process test images
+    X_test_processed = []
+    for img in X_test:
+        img = enhance_image(img)
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        feat = cnn_feature_extractor.predict(np.expand_dims(img, 0)/255.0, verbose=0)
+        X_test_processed.append(feat.flatten())
+    
+    y_pred = model.predict(np.array(X_test_processed))
+    print("\nKNN Evaluation:")
+    print(classification_report(y_test, model.le.transform(y_pred), target_names=class_names))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, model.le.transform(y_pred)))
+
+# -------------------- SVM Evaluation --------------------
+def evaluate_svm():
+    svm, scaler = joblib.load(SVM_MODEL_PATH)
+    X_test, y_test = prepare_test_data()
+    
+    X_test_processed = []
+    for img in X_test:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (128, 128)) / 255.0
+        X_test_processed.append(img.flatten())
+    
+    y_pred = svm.predict(scaler.transform(X_test_processed))
+    print("\nSVM Evaluation:")
+    print(classification_report(y_test, y_pred, target_names=class_names))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+# -------------------- ResNet Evaluation --------------------
+def evaluate_resnet():
+    model = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    model.fc = nn.Linear(model.fc.in_features, len(class_names))
+    model.load_state_dict(torch.load(RESNET_MODEL_PATH))
+    model.eval()
+    
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    dataset = datasets.ImageFolder(DATA_DIR, transform=transform)
+    test_loader = DataLoader(dataset, batch_size=32)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.numpy())
+    
+    print("\nResNet Evaluation:")
+    print(classification_report(all_labels, all_preds, target_names=class_names))
+    print("Confusion Matrix:")
+    print(confusion_matrix(all_labels, all_preds))
+
+# -------------------- Random Forest Evaluation --------------------
+def evaluate_rf():
+    model = joblib.load(RF_MODEL_PATH)
+    X_test, y_test = prepare_test_data()
+    
+    X_test_processed = []
+    for img in X_test:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if len(gray.shape) == 2:
+            gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        feat = cnn_feature_extractor.predict(np.expand_dims(gray, 0)/255.0, verbose=0)
+        X_test_processed.append(feat.flatten())
+    
+    y_pred = model.predict(np.array(X_test_processed))
+    print("\nRandom Forest Evaluation:")
+    print(classification_report(y_test, y_pred, target_names=class_names))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+# -------------------- GUI --------------------
+if __name__ == '__main__':
+    cnn_model = load_cnn_model(); print("CNN loaded.")
+    knn_model = load_knn_model(); print("KNN loaded.")
+    svm_model, scaler = load_svm_model(); print("SVM loaded.")
+    resnet_model = load_resnet_model(); print("ResNet loaded.")
+    rf_model = load_rf_model(); print("Random Forest loaded.")
+
+    print("Evaluating CNN Model:")
+    evaluate_cnn()
+    
+    print("\nEvaluating KNN Model:")
+    evaluate_knn()
+    
+    print("\nEvaluating SVM Model:")
+    evaluate_svm()
+    
+    print("\nEvaluating ResNet Model:")
+    evaluate_resnet()
+    
+    print("\nEvaluating Random Forest Model:")
+    evaluate_rf()
+
+    def predict(image, model_type):
+        img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        img_bgr = enhance_image(img_bgr)
         
-        # Filter out recipes that might have had parsing errors but still got through
-        valid_recipes = [r for r in recipes_to_display if r.get('title') and r['title'] not in ["Parsing Error", "No title found"]]
+        if model_type == 'CNN':
+            x = cv2.resize(img_bgr,(128,128))/255.0
+            preds = cnn_model.predict(np.expand_dims(x,0))[0]
+            return {cn: float(preds[i]) for i,cn in enumerate(class_names)}
+        
+        elif model_type == 'KNN':
+            feat = extract_features(img_bgr).reshape(1,-1)
+            lbl = knn_model.predict(feat)[0]
+            return {cn: 1.0 if cn==lbl else 0.0 for cn in class_names}
+        
+        elif model_type == 'SVM':
+            x = (cv2.resize(img_bgr,(128,128))/255.0).flatten().reshape(1,-1)
+            x_scaled = scaler.transform(x)
+            lbl = svm_model.predict(x_scaled)[0]
+            return {cn: 1.0 if cn==lbl else 0.0 for cn in class_names}
+        
+        elif model_type == 'ResNet':
+            pil = Image.fromarray(cv2.cvtColor(img_bgr,cv2.COLOR_BGR2RGB))
+            tr = transforms.Compose([
+                transforms.Resize((224,224)), transforms.ToTensor(),
+                transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+            ])
+            t = tr(pil).unsqueeze(0)
+            resnet_model.eval()
+            with torch.no_grad(): out = resnet_model(t)
+            idx = torch.argmax(out,1).item()
+            lbl = class_names[idx]
+            return {cn: 1.0 if cn==lbl else 0.0 for cn in class_names}
+        
+        elif model_type == 'RF':
+            lbl = predict_rf(rf_model, img_bgr)
+            return {cn: 1.0 if cn == lbl else 0.0 for cn in class_names}
+        
+        return {"Error":1.0}
 
-        if not valid_recipes:
-            st.warning("No valid recipes to display after filtering.")
-        else:
-            df = pd.DataFrame(valid_recipes)
-            display_cols = ['title', 'prep_time', 'cook_time', 'servings']
-            existing_display_cols = [col for col in display_cols if col in df.columns]
-            
-            if existing_display_cols:
-                st.dataframe(df[existing_display_cols], use_container_width=True)
-            else:
-                st.warning("Key columns for overview are missing in the fetched data.")
-
-            st.markdown("---")
-            st.subheader("\U0001F50D Recipe Details")
-            
-            # Ensure titles are unique for selectbox or handle duplicates if any
-            recipe_titles = [r['title'] for r in valid_recipes]
-            
-            if not recipe_titles:
-                st.info("No recipe titles available for selection.")
-            else:
-                # Handle potential duplicate titles for selectbox by appending index temporarily
-                unique_selection_titles = []
-                title_counts = {}
-                for r_title in recipe_titles:
-                    if r_title in title_counts:
-                        title_counts[r_title] += 1
-                        unique_selection_titles.append(f"{r_title} ({title_counts[r_title]})")
-                    else:
-                        title_counts[r_title] = 0 # 0 for the first one, so it doesn't get (0)
-                        unique_selection_titles.append(r_title)
-                
-                # Map display title back to original recipe index
-                selected_display_title = st.selectbox(
-                    "Select a recipe to view details:", 
-                    unique_selection_titles,
-                    index=0 if unique_selection_titles else None
-                )
-
-                selected_recipe = None
-                if selected_display_title:
-                    original_title_to_find = selected_display_title
-                    # If it was a duplicate, strip the counter " (count)"
-                    if " (" in selected_display_title and selected_display_title.endswith(")"):
-                        original_title_to_find = selected_display_title.rsplit(" (", 1)[0]
-
-                    # Find the correct recipe matching the potentially de-duplicated title
-                    current_occurrence = 0
-                    target_occurrence = 0
-                    if " (" in selected_display_title and selected_display_title.endswith(")"):
-                        try:
-                            target_occurrence = int(selected_display_title.rsplit(" (", 1)[1][:-1])
-                        except ValueError:
-                            pass # Not a numbered duplicate
-                    
-                    for idx, r in enumerate(valid_recipes):
-                        if r['title'] == original_title_to_find:
-                            if current_occurrence == target_occurrence:
-                                selected_recipe = r
-                                break
-                            current_occurrence += 1
-                
-                if selected_recipe:
-                    col1, col2 = st.columns([2,3])
-                    with col1:
-                        if selected_recipe.get('image_url'):
-                            st.image(selected_recipe['image_url'], caption=selected_recipe['title'], use_container_width=True)
-                        else:
-                            st.markdown("*No image available.*")
-                        st.markdown(f"**URL**: [{selected_recipe['title']}]({selected_recipe['url']})")
-                        st.markdown(f"**Prep Time**: {selected_recipe.get('prep_time', 'N/A')}")
-                        st.markdown(f"**Cook Time**: {selected_recipe.get('cook_time', 'N/A')}")
-                        st.markdown(f"**Servings**: {selected_recipe.get('servings', 'N/A')}")
-                    
-                    with col2:
-                        st.markdown(f"### {selected_recipe['title']}")
-                        st.markdown("#### \U0001F958 Ingredients") # Changed emoji
-                        st.text_area("", selected_recipe.get('ingredients', 'N/A'), height=200, key=f"ing_{selected_recipe['title']}")
-                        st.markdown("#### \U0001F4DC Directions") # Changed emoji
-                        st.text_area("", selected_recipe.get('directions', 'N/A'), height=300, key=f"dir_{selected_recipe['title']}")
-                else:
-                    st.info("Select a recipe to see its details.")
-    else:
-        st.info("No recipes loaded. Configure and click 'Start Crawling' in the sidebar.")
-
-    # Export results (Save to CSV)
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("\U0001F4BE Export")
-    if recipes_to_display: # Only show button if there are recipes
-        if st.sidebar.button("\U0001F4C2 Save Displayed Recipes to CSV", key="save_csv_button"):
-            valid_recipes_to_save = [r for r in recipes_to_display if r.get('title') and r['title'] not in ["Parsing Error", "No title found"]]
-            if valid_recipes_to_save:
-                df_to_save = pd.DataFrame(valid_recipes_to_save)
-                csv_file_name = "recipes_export.csv"
-                try:
-                    csv_data = df_to_save.to_csv(index=False).encode('utf-8')
-                    st.sidebar.download_button(
-                        label="\U0001F4E5 Download CSV File",
-                        data=csv_data,
-                        file_name=csv_file_name,
-                        mime="text/csv",
-                    )
-                    st.sidebar.success(f"CSV prepared for download as `{csv_file_name}`.")
-                except Exception as e:
-                    st.sidebar.error(f"Failed to create CSV: {e}")
-            else:
-                st.sidebar.warning("No valid recipes to save.")
-    else:
-        st.sidebar.button("\U0001F4C2 Save Displayed Recipes to CSV", disabled=True, key="save_csv_button_disabled")
-
-if __name__ == "__main__":
-    main()
+    iface = gr.Interface(
+        fn=predict,
+        inputs=[gr.Image(type="numpy", label="Upload an Animal Image"),
+                gr.Radio(choices=["CNN","KNN","SVM","ResNet","RF"],
+                         label="Select Model", value="CNN")],
+        outputs=gr.Label(num_top_classes=3),
+        title="Animal Classifier",
+        description="Upload an image of an animal and select the classification model."
+    )
+    iface.launch()
